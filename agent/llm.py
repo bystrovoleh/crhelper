@@ -1,9 +1,13 @@
 import json
 import re
 import subprocess
+import sys
 import time
 from typing import Any
 from config.settings import LLM_PROVIDER, ANTHROPIC_API_KEY, CLAUDE_MODEL
+
+# On Windows, claude is installed as claude.cmd
+_CLAUDE_CMD = "claude.cmd" if sys.platform == "win32" else "claude"
 
 
 # ---------------------------------------------------------------------------
@@ -59,10 +63,11 @@ class ClaudeCLIBackend:
     def complete(self, system: str, user: str, _retry: int = 0) -> str:
         prompt = f"{system}\n\n{user}" if system else user
         result = subprocess.run(
-            ["claude", "-p", prompt, "--output-format", "text"],
+            [_CLAUDE_CMD, "-p", prompt, "--output-format", "text"],
             capture_output=True,
             text=True,
             timeout=120,
+            shell=(sys.platform == "win32"),
         )
         if result.returncode != 0:
             stderr = result.stderr.strip()
