@@ -1,0 +1,15 @@
+{
+  "futures": [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "XRPUSDT",
+    "ATOMUSDT",
+    "LDOUSDT",
+    "ARBUSDT",
+    "BNBUSDT",
+    "ADAUSDT",
+    "DOGEUSDT",
+    "HYPEUSDT"
+  ]
+}
