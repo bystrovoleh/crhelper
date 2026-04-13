@@ -9,12 +9,10 @@ import hashlib
 import hmac
 import json
 import time
-import requests
-import urllib3
 from datetime import datetime, timezone
 from config.settings import MEXC_API_KEY, MEXC_API_SECRET, MEXC_BASE_URL
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+from curl_cffi.requests import Session as CurlSession
 
 
 def _to_mexc_symbol(symbol: str) -> str:
@@ -37,12 +35,8 @@ class MEXCTrader:
         self.base_url = MEXC_BASE_URL
         self.api_key = MEXC_API_KEY
         self.api_secret = MEXC_API_SECRET
-        self.session = requests.Session()
-        self.session.verify = False  # workaround for TLSV1_ALERT_INTERNAL_ERROR on some systems
-        self.session.headers.update({
-            "Content-Type": "application/json",
-            "ApiKey": self.api_key,
-        })
+        # curl_cffi impersonates Chrome TLS fingerprint — bypasses Cloudflare WAF
+        self.session = CurlSession(impersonate="chrome110")
 
     # ------------------------------------------------------------------
     # Auth helpers
@@ -68,49 +62,64 @@ class MEXCTrader:
             "Content-Type": "application/json",
         }
 
-    def _get(self, endpoint: str, params: dict = None) -> dict:
+    def _get(self, endpoint: str, params: dict = None, _retry: int = 0) -> dict:
         params = params or {}
         ts = int(time.time() * 1000)
-        # For GET: params_str is sorted query string
         params_str = "&".join(f"{k}={v}" for k, v in sorted(params.items())) if params else ""
         headers = self._signed_headers(ts, params_str)
 
         url = f"{self.base_url}{endpoint}"
-        resp = self.session.get(url, params=params, headers=headers, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        # MEXC sometimes returns a list directly instead of {"success": true, "data": [...]}
+        try:
+            resp = self.session.get(url, params=params, headers=headers, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            if _retry < 2:
+                time.sleep(1)
+                return self._get(endpoint, params, _retry + 1)
+            raise
         if isinstance(data, list):
             return {"success": True, "data": data}
         if not data.get("success", True):
             raise ValueError(f"MEXC API error: {data.get('code')} — {data.get('message')}")
         return data
 
-    def _post(self, endpoint: str, body: dict = None) -> dict:
+    def _post(self, endpoint: str, body: dict = None, _retry: int = 0) -> dict:
         body = body or {}
         ts = int(time.time() * 1000)
-        # MEXC POST: sign sorted JSON string, send as raw string body
         body_str = json.dumps(body, sort_keys=True, separators=(",", ":")) if body else ""
         headers = self._signed_headers(ts, body_str)
 
         url = f"{self.base_url}{endpoint}"
-        resp = self.session.post(url, data=body_str, headers=headers, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
+        try:
+            resp = self.session.post(url, data=body_str, headers=headers, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            if _retry < 2:
+                time.sleep(1)
+                return self._post(endpoint, body, _retry + 1)
+            raise
         if not data.get("success", True):
             raise ValueError(f"MEXC API error: {data.get('code')} — {data.get('message')}")
         return data
 
-    def _delete(self, endpoint: str, params: dict = None) -> dict:
+    def _delete(self, endpoint: str, params: dict = None, _retry: int = 0) -> dict:
         params = params or {}
         ts = int(time.time() * 1000)
         params_str = "&".join(f"{k}={v}" for k, v in sorted(params.items())) if params else ""
         headers = self._signed_headers(ts, params_str)
 
         url = f"{self.base_url}{endpoint}"
-        resp = self.session.delete(url, params=params, headers=headers, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
+        try:
+            resp = self.session.delete(url, params=params, headers=headers, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            if _retry < 2:
+                time.sleep(1)
+                return self._delete(endpoint, params, _retry + 1)
+            raise
         if not data.get("success", True):
             raise ValueError(f"MEXC API error: {data.get('code')} — {data.get('message')}")
         return data
@@ -125,9 +134,17 @@ class MEXCTrader:
         assets = data.get("data", [])
         for asset in assets:
             if asset.get("currency") == "USDT":
-                # availableOpen = what can actually be used for new positions
                 val = float(asset.get("availableOpen", asset.get("availableBalance", 0)))
                 return val
+        return 0.0
+
+    def get_equity(self) -> float:
+        """Return total USDT equity (available + frozen margin in orders/positions)."""
+        data = self._get("/api/v1/private/account/assets")
+        assets = data.get("data", [])
+        for asset in assets:
+            if asset.get("currency") == "USDT":
+                return float(asset.get("equity", asset.get("cashBalance", 0)))
         return 0.0
 
     # ------------------------------------------------------------------
@@ -151,7 +168,7 @@ class MEXCTrader:
         positions = self.get_open_positions(symbol)
         sym = _to_mexc_symbol(symbol)
         for p in positions:
-            if p.get("symbol") == sym and float(p.get("vol", 0)) > 0:
+            if p.get("symbol") == sym and float(p.get("holdVol") or p.get("vol") or 0) > 0:
                 return True
         return False
 
@@ -183,26 +200,19 @@ class MEXCTrader:
     # Order management
     # ------------------------------------------------------------------
 
-    def cancel_order(self, order_id: str, symbol: str) -> bool:
-        """Cancel a single order by ID."""
-        try:
-            sym = _to_mexc_symbol(symbol)
-            self._delete(f"/api/v1/private/order/cancel/{order_id}")
-            print(f"  [trader] Cancelled order {order_id} for {sym}")
-            return True
-        except Exception as e:
-            print(f"  [trader] Failed to cancel order {order_id}: {e}")
-            return False
-
     def cancel_all_orders(self, symbol: str) -> int:
         """Cancel all open orders for a symbol. Returns count cancelled."""
         orders = self.get_open_orders(symbol)
-        cancelled = 0
-        for order in orders:
-            order_id = order.get("orderId") or order.get("id")
-            if order_id and self.cancel_order(str(order_id), symbol):
-                cancelled += 1
-        return cancelled
+        if not orders:
+            return 0
+        sym = _to_mexc_symbol(symbol)
+        try:
+            self._post("/api/v1/private/order/cancel_all", {"symbol": sym})
+            print(f"  [trader] Cancelled all orders for {sym}")
+            return len(orders)
+        except Exception as e:
+            print(f"  [trader] Failed to cancel_all for {sym}: {e}")
+            return 0
 
     def set_leverage(self, symbol: str, leverage: int):
         """Set leverage for a symbol (both long and short sides)."""
@@ -273,13 +283,142 @@ class MEXCTrader:
             body["takeProfitPrice"] = str(tp)
 
         try:
-            data = self._post("/api/v1/private/order/submit", body)
+            data = self._post("/api/v1/private/order/create", body)
             order_id = data.get("data")
             print(f"  [trader] ✓ Placed {side} limit @ {price}  vol={vol}  sl={sl}  tp={tp}  id={order_id}")
             return {"order_id": order_id, "symbol": sym, "side": side, "price": price, "vol": vol}
         except Exception as e:
             print(f"  [trader] ✗ Failed to place order: {e}")
             return None
+
+    def close_position_limit(self, symbol: str, direction: str) -> dict | None:
+        """
+        Close an open position with a limit order at current best price.
+
+        direction: direction of the EXISTING position ("long" | "short")
+          - closing a long  → side=4 (Close Long)
+          - closing a short → side=2 (Close Short)
+
+        Fetches current bid/ask from ticker and places a limit order
+        slightly inside the spread to get fast fill:
+          - closing long  → sell at current bid
+          - closing short → buy  at current ask
+        """
+        sym = _to_mexc_symbol(symbol)
+
+        # Get current position volume
+        positions = self.get_open_positions(symbol)
+        vol = 0
+        for p in positions:
+            if p.get("symbol") == sym and float(p.get("holdVol") or p.get("vol") or 0) > 0:
+                vol = int(float(p.get("holdVol") or p.get("vol") or 0))
+                break
+
+        if vol <= 0:
+            print(f"  [trader] close_position_limit: no open position found for {sym}")
+            return None
+
+        # Get current ticker price
+        try:
+            resp = self.session.get(
+                f"{self.base_url}/api/v1/contract/ticker",
+                params={"symbol": sym},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            ticker = resp.json().get("data", {})
+            # Use lastPrice as limit price — gets filled immediately if market moves to it
+            price = float(ticker.get("lastPrice", 0))
+        except Exception as e:
+            print(f"  [trader] Failed to get ticker for {sym}: {e}")
+            return None
+
+        if price <= 0:
+            print(f"  [trader] Invalid price {price} for {sym}")
+            return None
+
+        # side=4 closes long, side=2 closes short
+        order_side = 4 if direction == "long" else 2
+
+        body = {
+            "symbol": sym,
+            "price": str(price),
+            "vol": str(vol),
+            "side": order_side,
+            "type": 1,       # 1 = limit order
+            "openType": 1,   # 1 = isolated margin
+        }
+
+        try:
+            data = self._post("/api/v1/private/order/create", body)
+            order_id = data.get("data")
+            print(f"  [trader] ✓ Close {direction} limit @ {price}  vol={vol}  id={order_id}")
+            return {"order_id": order_id, "symbol": sym, "direction": direction, "price": price, "vol": vol}
+        except Exception as e:
+            print(f"  [trader] ✗ Failed to close position: {e}")
+            return None
+
+    def get_stop_orders(self, symbol: str) -> list[dict]:
+        """Return open stop orders (SL/TP) for a symbol."""
+        sym = _to_mexc_symbol(symbol)
+        try:
+            data = self._get("/api/v1/private/stoporder/list/orders", {"symbol": sym, "isFinished": 0})
+            raw = data.get("data", [])
+            if isinstance(raw, list):
+                return raw
+            if isinstance(raw, dict):
+                return raw.get("resultList", []) or []
+        except Exception as e:
+            print(f"  [trader] get_stop_orders warning: {e}")
+        return []
+
+    def change_position_sl(self, symbol: str, position_type: int, new_sl: float) -> bool:
+        """
+        Change stop loss on an open position.
+        position_type: 1 = long, 2 = short
+        Finds the matching stop order by positionType and updates its SL.
+        Returns True on success.
+        """
+        sym = _to_mexc_symbol(symbol)
+        stop_orders = self.get_stop_orders(symbol)
+
+        # Find the stop order matching this position side
+        order_id = None
+        for o in stop_orders:
+            if int(o.get("positionType", 0)) == position_type:
+                order_id = o.get("id") or o.get("orderId")
+                break
+
+        if not order_id:
+            # No existing stop order — create a new one via trigger order
+            # side: closing long = 4, closing short = 2
+            close_side = 4 if position_type == 1 else 2
+            try:
+                self._post("/api/v1/private/stoporder/create", {
+                    "symbol": sym,
+                    "side": close_side,
+                    "stopLossPrice": str(new_sl),
+                    "openType": 1,
+                    "vol": 0,           # 0 = close entire position
+                    "positionType": position_type,
+                })
+                print(f"  [trader] ✓ Created new SL @ {new_sl} for {sym} pos_type={position_type}")
+                return True
+            except Exception as e:
+                print(f"  [trader] ✗ Failed to create SL: {e}")
+                return False
+
+        # Update existing stop order
+        try:
+            self._post("/api/v1/private/stoporder/change_price", {
+                "orderId": str(order_id),
+                "stopLossPrice": str(new_sl),
+            })
+            print(f"  [trader] ✓ Updated SL → {new_sl} for {sym} order {order_id}")
+            return True
+        except Exception as e:
+            print(f"  [trader] ✗ Failed to change SL: {e}")
+            return False
 
     def get_contract_size(self, symbol: str) -> tuple[float, int]:
         """
@@ -303,18 +442,18 @@ class MEXCTrader:
             print(f"  [trader] get_contract_size warning: {e}")
             return 1.0, 1
 
-    def calc_vol(self, symbol: str, price: float, usdt_amount: float) -> int:
+    def calc_vol(self, symbol: str, price: float, usdt_amount: float, leverage: int = 10) -> int:
         """
-        Calculate contract volume (integer) from USDT amount.
-        MEXC: vol = floor(usdt_amount / (price * contractSize))
-        Minimum is minVol (usually 1).
-        Returns 0 if below minimum.
+        Calculate contract volume (integer) from USDT margin amount.
+        MEXC: vol = floor(margin * leverage / (price * contractSize))
+        usdt_amount is treated as margin (collateral), not notional.
+        Minimum is minVol (usually 1). Returns 0 if below minimum.
         """
         if price <= 0:
             return 0
         contract_size, min_vol = self.get_contract_size(symbol)
         usdt_per_contract = price * contract_size
-        vol = int(usdt_amount / usdt_per_contract)
+        vol = int((usdt_amount * leverage) / usdt_per_contract)
         if vol < min_vol:
             return 0
         return vol
